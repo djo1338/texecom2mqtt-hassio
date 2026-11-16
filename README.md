@@ -1,4 +1,48 @@
-# texecom2mqtt
+# texecom2mqtt (fork)
+
+> This is a fork of [dchesterton/texecom2mqtt-hassio](https://github.com/dchesterton/texecom2mqtt-hassio) that fixes Home Assistant staying « triggered » after an alarm. Image: `ghcr.io/djo1338/texecom2mqtt:1.3.1-nojo.1`. See [About this fork](#about-this-fork); the original documentation follows it, unchanged.
+
+## About this fork
+
+Upstream looks abandoned: 1.3.1 (February 2025) is the last release, and the application sources were never published. The first commit of this fork adds the JavaScript bundle embedded in the upstream image, unmodified. Every fix is a plain diff on top of it.
+
+### The bug
+
+On a Premier Elite panel that reports alarms through a SmartCom, Home Assistant can stay « triggered » after an alarm, even after the panel has been disarmed ([upstream issue 134](https://github.com/dchesterton/texecom2mqtt-hassio/issues/134) looks like the same problem):
+
+1. **Events lost while the panel reports.** While the panel reports the alarm, it stops answering on the IP link for ~20–35 s. The keepalive times out and the app reconnects about 45 s after the alarm, so area events sent in that window (keypad disarm, reset) are lost.
+2. **A stale flag after reconnect.** On reconnect, the app rebuilds the area status from the panel's area flags. Flag 0 (« Alarm ») stays set after a keypad disarm until the alarm is reset, so the area is republished as in alarm.
+3. **No re-read.** A later reset or disarm that doesn't change the area state produces no area event, and the app never reads the flags again.
+
+### Changes in 1.3.1-nojo.1
+
+The fix only re-reads areas currently shown as in alarm. It corrects an area only if no area event arrived during the read. Exit and entry delays, and the full re-read on reconnect, behave as upstream. A re-read runs:
+
+- **3 s after a remote reset or disarm,** so pressing « Disarm » in Home Assistant clears a stale « triggered »;
+- **on the panel's « Reset After Alarm » log event;**
+- **every 60 s while an area is in alarm.**
+
+Whenever flag 0 is set, every active area flag is logged once at INFO (`Area A alarm flag is set, active area flags: …`).
+
+### Usage
+
+| Install | How |
+|---|---|
+| Docker / Docker Compose | Use `ghcr.io/djo1338/texecom2mqtt:1.3.1-nojo.1` instead of `dchesterton/texecom2mqtt:latest` in the commands below (amd64, arm64, armv7). See `compose.example.yaml`. |
+| Home Assistant add-on | Add `https://github.com/djo1338/texecom2mqtt-hassio` as the add-on repository. Not tested as an add-on yet. |
+
+### Provenance and tests
+
+| | |
+|---|---|
+| Upstream image | `dchesterton/texecom2mqtt:1.3.1`, digest `sha256:24d170a0eda71088cd13c0d4d074715d3c9508cf7b55cb7bff63f8facd2aac71` |
+| Binary | `/app/app/dist/texecom2mqtt`, a Node 23.7 single executable |
+| Extracted bundle | `app/dist/texecom2mqtt.js` (sha256 `f7fd83d3…a0c9ce423` before the fix), via `tools/extract-bundle.mjs` |
+| Bundled npm packages | `THIRD_PARTY_NOTICES.md` |
+
+`node --test "test/*.test.mjs"` runs the bundle against a fake panel link, with no network. `T2M_BUNDLE=<path>` runs the same tests on another bundle; on the upstream one, 10 of the 13 fail.
+
+---
 
 An application to interface with a _Texecom Premier Elite_ alarm panel via MQTT. It provides real-time sensor
 updates (irrespective of whether the panel is armed or not) and full arming/disarming/part-arming support. The application

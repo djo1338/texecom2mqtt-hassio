@@ -45608,6 +45608,10 @@ async function deleteCache() {
 
 // src/panel.ts
 var import_promises3 = require("timers/promises");
+// nojo: delay before re-reading the area flags after a reset/disarm, and the
+// interval of the re-read while an area is shown as "in alarm"
+var ALARM_REFRESH_DELAY = 3e3;
+var ALARM_POLL_INTERVAL = 6e4;
 var Panel = class extends import_events3.EventEmitter {
   constructor(config, log) {
     super();
@@ -45622,6 +45626,10 @@ var Panel = class extends import_events3.EventEmitter {
     this.texecom.on("zone_event", this.handleZoneEvent);
     this.texecom.on("log_event", this.handleLogEvent);
     this.texecom.on("status", this.handlePanelStatus);
+    this.alarmPollInterval = setInterval(() => {
+      this.refreshAlarmedAreas("periodic check while in alarm", true);
+    }, ALARM_POLL_INTERVAL);
+    this.alarmPollInterval.unref?.();
   }
   areas = [];
   zones = [];
@@ -45637,6 +45645,10 @@ var Panel = class extends import_events3.EventEmitter {
   lastActiveZones = {};
   hasPanelConfig = false;
   loggedIn = false;
+  alarmPollInterval;
+  alarmRefreshTimeout;
+  areaRefreshReady = false;
+  lastAlarmFlagsLog = {};
   handlePanelStatus = async (status) => {
     this.emit("status", status);
     switch (status) {
@@ -45646,6 +45658,11 @@ var Panel = class extends import_events3.EventEmitter {
         if (this.keepaliveTimeout) {
           clearTimeout(this.keepaliveTimeout);
           this.keepaliveTimeout = void 0;
+        }
+        this.areaRefreshReady = false;
+        if (this.alarmRefreshTimeout) {
+          clearTimeout(this.alarmRefreshTimeout);
+          this.alarmRefreshTimeout = void 0;
         }
         break;
       case "connected" /* Connected */: {
@@ -45737,6 +45754,7 @@ var Panel = class extends import_events3.EventEmitter {
         await this.refreshData();
         this.log.info("Application ready");
         this.initComplete = true;
+        this.areaRefreshReady = true;
         this.initKeepalive();
         break;
       }
@@ -45759,6 +45777,7 @@ var Panel = class extends import_events3.EventEmitter {
     area2.status = status;
     area2.partArm = partArm;
     area2.lastActiveZone = lastActiveZone;
+    area2.statusVersion = (area2.statusVersion ?? 0) + 1;
     this.log.info(
       `${area2.name} status changed to ${areaStatus(area2)}${area2.status === 5 /* InAlarm */ ? ` (last active zone: ${area2.lastActiveZone?.name})` : ""}`
     );
@@ -45846,6 +45865,11 @@ var Panel = class extends import_events3.EventEmitter {
         this.log.info("Re-loading zone and area data");
         await this.loadInitialData();
         await this.refreshData();
+        break;
+      // nojo: resetting an alarm on an area that is already disarmed changes no area
+      // state, so the panel sends no area event: re-read the flags instead
+      case 45 /* ResetAfterAlarm */:
+        this.scheduleAlarmRefresh("reset after alarm");
         break;
       // a log event is generated for auto arm/disarm and arm failure but not an area event so
       // we need to manually update the area states
@@ -45987,6 +46011,72 @@ var Panel = class extends import_events3.EventEmitter {
   };
   async updateAreaStates() {
     this.log.info("Updating all area states...");
+    for (const { area: area2, status, partArm } of await this.readAreaStatuses()) {
+      if (status === 3 /* Armed */ || status === 4 /* PartArmed */) {
+        area2.partArm = partArm;
+      }
+      area2.status = status;
+      area2.statusVersion = (area2.statusVersion ?? 0) + 1;
+    }
+  }
+  // nojo: logs every active area flag whenever the Alarm flag (0) is set, once per
+  // distinct set, to learn what the panel reports after an alarm
+  logAlarmFlags(area2, flagArray) {
+    if (!flagArray[0 /* Alarm */]) {
+      delete this.lastAlarmFlagsLog[area2.number];
+      return;
+    }
+    const active = flagArray.map((flag, i) => flag ? i : -1).filter((i) => i >= 0).join(",");
+    if (this.lastAlarmFlagsLog[area2.number] === active) {
+      return;
+    }
+    this.lastAlarmFlagsLog[area2.number] = active;
+    this.log.info(`Area ${area2.id} alarm flag is set, active area flags: ${active}`);
+  }
+  // nojo: re-reads the area flags and corrects only the areas shown as "in alarm".
+  // After an alarm the panel drops the UDL session (SmartCom reporting), so the
+  // disarm/reset area events can be lost and the reconnect reads a latched alarm
+  // flag; nothing else ever re-reads it.
+  scheduleAlarmRefresh(reason) {
+    if (this.alarmRefreshTimeout) {
+      clearTimeout(this.alarmRefreshTimeout);
+    }
+    this.alarmRefreshTimeout = setTimeout(() => {
+      this.alarmRefreshTimeout = void 0;
+      this.refreshAlarmedAreas(reason);
+    }, ALARM_REFRESH_DELAY);
+  }
+  async refreshAlarmedAreas(reason, quiet = false) {
+    if (!this.areaRefreshReady || !this.areas.some((area2) => area2.status === 5 /* InAlarm */)) {
+      return;
+    }
+    this.log[quiet ? "debug" : "info"](`Re-reading area flags (${reason})`);
+    const versions = new Map(this.areas.map((area2) => [area2, area2.statusVersion ?? 0]));
+    let statuses;
+    try {
+      statuses = await this.readAreaStatuses();
+    } catch (error) {
+      if (error instanceof TexecomConnectionError) {
+        throw error;
+      }
+      this.log.warning(`Could not re-read area flags: ${error?.message ?? error}`);
+      return;
+    }
+    for (const { area: area2, status, partArm } of statuses) {
+      // skip if an area event changed the area while the panel was answering
+      if (area2.status !== 5 /* InAlarm */ || status === 5 /* InAlarm */ || (area2.statusVersion ?? 0) !== versions.get(area2)) {
+        continue;
+      }
+      area2.status = status;
+      area2.partArm = status === 4 /* PartArmed */ ? partArm : void 0;
+      area2.statusVersion = (area2.statusVersion ?? 0) + 1;
+      this.log.info(
+        `${area2.name} status changed to ${areaStatus(area2)} (re-read after ${reason})`
+      );
+      this.emit("area_update", area2);
+    }
+  }
+  async readAreaStatuses() {
     const areaSize = this.tAreaSize();
     const maxFlag = areaSize === 8 ? 30 : 72;
     const flags = await this.command().getAreaFlags(0, maxFlag, areaSize);
@@ -45998,7 +46088,7 @@ var Panel = class extends import_events3.EventEmitter {
         `Received area part arm flags: ${partArmFlags.toString("hex")}`
       );
     }
-    for (const area2 of this.areas) {
+    return this.areas.map((area2) => {
       const flagArray = [];
       for (let i = 0; i < maxFlag; i++) {
         flagArray[i] = this.getAreaBitmapFlag(area2, i, flags);
@@ -46006,8 +46096,9 @@ var Panel = class extends import_events3.EventEmitter {
       this.log.debug(
         `Received area flags for Area ${area2.id} (${area2.number}): ${flagArray.map((flag) => Number(flag)).join(",")}`
       );
+      this.logAlarmFlags(area2, flagArray);
       if (flagArray[0 /* Alarm */]) {
-        area2.status = 5 /* InAlarm */;
+        return { area: area2, status: 5 /* InAlarm */ };
       } else if (flagArray[21 /* Armed */] || flagArray[22 /* FullArmed */] || flagArray[23 /* PartArmed */] || flagArray[26 /* ForceArmed */]) {
         let partArm1, partArm2, partArm3;
         if (partArmFlags) {
@@ -46019,12 +46110,12 @@ var Panel = class extends import_events3.EventEmitter {
           partArm2 = flagArray[51 /* PartArm2 */];
           partArm3 = flagArray[52 /* PartArm3 */];
         }
-        area2.partArm = partArm1 ? 1 : partArm2 ? 2 : partArm3 ? 3 : void 0;
-        area2.status = area2.partArm ? 4 /* PartArmed */ : 3 /* Armed */;
+        const partArm = partArm1 ? 1 : partArm2 ? 2 : partArm3 ? 3 : void 0;
+        return { area: area2, status: partArm ? 4 /* PartArmed */ : 3 /* Armed */, partArm };
       } else {
-        area2.status = 0 /* Disarmed */;
+        return { area: area2, status: 0 /* Disarmed */ };
       }
-    }
+    });
   }
   createZoneFromPanelZone = (panelZone) => {
     const config = this.config.zones.find(
@@ -46149,6 +46240,7 @@ var Panel = class extends import_events3.EventEmitter {
     if (!success) {
       this.log.warning(`Could not disarm ${area2.name}`);
     }
+    this.scheduleAlarmRefresh("remote disarm");
   }
   async reset(area2) {
     this.log.info(`Remotely resetting ${area2.name}`);
@@ -46159,6 +46251,7 @@ var Panel = class extends import_events3.EventEmitter {
     if (!success) {
       this.log.warning(`Could not reset ${area2.name}`);
     }
+    this.scheduleAlarmRefresh("remote reset");
   }
   async arm(area2, armType) {
     if ([4 /* PartArmed */, 3 /* Armed */].includes(area2.status)) {
@@ -46195,6 +46288,10 @@ var Panel = class extends import_events3.EventEmitter {
     return this.texecom.reconnect();
   }
   end() {
+    clearInterval(this.alarmPollInterval);
+    if (this.alarmRefreshTimeout) {
+      clearTimeout(this.alarmRefreshTimeout);
+    }
     return this.texecom.end(this.loggedIn);
   }
 };

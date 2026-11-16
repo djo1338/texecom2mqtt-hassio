@@ -1,3 +1,12 @@
+## 1.3.1-nojo.1 (2026-11-16)
+
+Fork of 1.3.1: https://github.com/djo1338/texecom2mqtt-hassio
+
+### Bug Fixes
+
+* re-read the area flags of areas shown as "in alarm" 3 s after a remote reset or disarm, on the Reset After Alarm log event and every 60 s, so Home Assistant no longer stays "triggered" after an alarm whose disarm was missed while the panel was reporting it
+* log every active area flag whenever the Alarm flag is set
+
 ## [1.3.1](https://github.com/dchesterton/texecom2mqtt/compare/v1.3.0...v1.3.1) (2025-02-25)
 
 

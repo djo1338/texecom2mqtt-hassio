@@ -1,3 +1,9 @@
+## 1.3.1-nojo.2 (2026-11-20)
+
+### Bug Fixes
+
+* a remote disarm lost because the panel dropped the connection while reporting an alarm is sent again after the reconnect, if the area is still in alarm, the request is less than 2 minutes old and no arm command was sent since
+
 ## 1.3.1-nojo.1 (2026-11-16)
 
 Fork of 1.3.1: https://github.com/djo1338/texecom2mqtt-hassio

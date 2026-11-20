@@ -1,6 +1,6 @@
 # texecom2mqtt (fork)
 
-> This is a fork of [dchesterton/texecom2mqtt-hassio](https://github.com/dchesterton/texecom2mqtt-hassio) that fixes Home Assistant staying « triggered » after an alarm. Image: `ghcr.io/djo1338/texecom2mqtt:1.3.1-nojo.1`. See [About this fork](#about-this-fork); the original documentation follows it, unchanged.
+> This is a fork of [dchesterton/texecom2mqtt-hassio](https://github.com/dchesterton/texecom2mqtt-hassio) that fixes Home Assistant staying « triggered » after an alarm, and a disarm sent from Home Assistant during an alarm being lost. Image: `ghcr.io/djo1338/texecom2mqtt:1.3.1-nojo.2`. See [About this fork](#about-this-fork); the original documentation follows it, unchanged.
 
 ## About this fork
 
@@ -24,11 +24,23 @@ The fix only re-reads areas currently shown as in alarm. It corrects an area onl
 
 Whenever flag 0 is set, every active area flag is logged once at INFO (`Area A alarm flag is set, active area flags: …`).
 
+### Changes in 1.3.1-nojo.2
+
+A remote disarm sent while the panel is reporting an alarm is lost: the panel does not answer, the app reconnects, and the commands queued meanwhile are dropped. Pressing « Disarm » in Home Assistant during the first ~45 s of an alarm did nothing.
+
+The app now remembers a remote disarm until the panel answers it. If the connection drops first, the disarm (reset + disarm) is sent again right after the reconnect, but only if:
+
+- **the area is still in alarm** after the reconnect re-read;
+- **the request is less than 2 minutes old;**
+- **no arm command was sent since.**
+
+Arming is never retried.
+
 ### Usage
 
 | Install | How |
 |---|---|
-| Docker / Docker Compose | Use `ghcr.io/djo1338/texecom2mqtt:1.3.1-nojo.1` instead of `dchesterton/texecom2mqtt:latest` in the commands below (amd64, arm64, armv7). See `compose.example.yaml`. |
+| Docker / Docker Compose | Use `ghcr.io/djo1338/texecom2mqtt:1.3.1-nojo.2` instead of `dchesterton/texecom2mqtt:latest` in the commands below (amd64, arm64, armv7). See `compose.example.yaml`. |
 | Home Assistant add-on | Add `https://github.com/djo1338/texecom2mqtt-hassio` as the add-on repository. Not tested as an add-on yet. |
 
 ### Provenance and tests

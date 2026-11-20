@@ -61,7 +61,13 @@ const setup = ({ status, flags = [] }) => {
     log
   );
   const calls = [];
-  const fake = { flags, error: undefined, onRead: undefined };
+  // hang: the command is queued but never answered, as when the panel drops the
+  // connection (the queue is then cleared without settling the promise)
+  const fake = { flags, error: undefined, onRead: undefined, hang: false };
+  const send = (name, result) => {
+    calls.push(name);
+    return fake.hang ? new Promise(() => {}) : Promise.resolve(result);
+  };
   panel.texecom = {
     getAreaFlags: async (start, count, areaSize) => {
       calls.push("getAreaFlags");
@@ -73,15 +79,21 @@ const setup = ({ status, flags = [] }) => {
       }
       return buf;
     },
-    reset: async () => (calls.push("reset"), true),
-    disarm: async () => (calls.push("disarm"), true),
-    arm: async () => (calls.push("arm"), true),
+    reset: () => send("reset", true),
+    disarm: () => send("disarm", true),
+    arm: () => send("arm", true),
+    setEventMessages: async () => true,
     getSystemPower: async () => false,
   };
+  // reconnect path: login, power and the full re-read are not under test here
+  panel.login = async () => true;
+  panel.fetchSystemPower = async () => {};
+  panel.refreshData = async () => {};
   panel.device = { zones: 24, model: "Premier Elite 24", serialNumber: "0", firmwareVersion: "0" };
   panel.areas = [panel.createAreaFromPanelArea({ id: "A", number: 1, panelName: "Maison" })];
   panel.areas[0].status = status;
   panel.initComplete = true;
+  panel.hasPanelConfig = true;
   panel.loggedIn = true;
   panel.areaRefreshReady = true;
   const updates = [];
@@ -91,7 +103,7 @@ const setup = ({ status, flags = [] }) => {
 
 const reads = (calls) => calls.filter((c) => c === "getAreaFlags").length;
 
-beforeEach(() => mock.timers.enable({ apis: ["setTimeout", "setInterval"] }));
+beforeEach(() => mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1_795_000_000_000 }));
 afterEach(() => mock.timers.reset());
 
 test("remote disarm while shown in alarm re-reads the flags and publishes Disarmed", async () => {
@@ -229,4 +241,83 @@ test("full re-read on reconnect keeps the upstream mapping", async () => {
   await armed.panel.updateAreaStates();
   assert.equal(armed.area.status, ARMED);
   assert.equal(armed.area.partArm, undefined);
+});
+
+// The panel drops the connection for ~30-45 s on every alarm (SmartCom
+// reporting). A remote disarm sent in that window is lost: the command queue is
+// cleared on disconnect. It is sent again once the panel is back.
+const cmds = (calls) => calls.filter((c) => c !== "getAreaFlags");
+const reconnect = async (panel) => {
+  await panel.handlePanelStatus("disconnected");
+  await panel.handlePanelStatus("connected");
+  await flush();
+};
+
+test("a remote disarm lost with the panel connection is sent again once the panel is back", async () => {
+  const { panel, area, calls, fake, log } = setup({ status: IN_ALARM, flags: [0] });
+  fake.hang = true;
+  panel.disarm(area);
+  await flush();
+  assert.deepEqual(cmds(calls), ["reset"]);
+  fake.hang = false;
+  mock.timers.tick(25000);
+  await reconnect(panel);
+  assert.deepEqual(cmds(calls), ["reset", "reset", "disarm"]);
+  assert.ok(log.lines.includes("info: Retrying the remote disarm of Maison requested 25s ago (the panel connection was lost)"));
+});
+
+test("a lost remote disarm is retried at every reconnect until it gets through", async () => {
+  const { panel, area, calls, fake } = setup({ status: IN_ALARM, flags: [0] });
+  fake.hang = true;
+  panel.disarm(area);
+  await reconnect(panel);
+  assert.deepEqual(cmds(calls), ["reset", "reset"]);
+  fake.hang = false;
+  await reconnect(panel);
+  assert.deepEqual(cmds(calls), ["reset", "reset", "reset", "disarm"]);
+  await reconnect(panel);
+  assert.deepEqual(cmds(calls), ["reset", "reset", "reset", "disarm"]);
+});
+
+test("a lost remote disarm older than 2 minutes is dropped", async () => {
+  const { panel, area, calls, fake, log } = setup({ status: IN_ALARM, flags: [0] });
+  fake.hang = true;
+  panel.disarm(area);
+  await flush();
+  fake.hang = false;
+  mock.timers.tick(120001);
+  await reconnect(panel);
+  assert.deepEqual(cmds(calls), ["reset"]);
+  assert.ok(log.lines.includes("warning: Not retrying the remote disarm of Maison: requested 120s ago"));
+});
+
+test("a lost remote disarm is not retried when the area is no longer in alarm", async () => {
+  const { panel, area, calls, fake } = setup({ status: IN_ALARM, flags: [] });
+  fake.hang = true;
+  panel.disarm(area);
+  await flush();
+  fake.hang = false;
+  await panel.handlePanelStatus("disconnected");
+  area.status = ARMED;
+  await panel.handlePanelStatus("connected");
+  await flush();
+  assert.deepEqual(cmds(calls), ["reset"]);
+});
+
+test("an arm request cancels the retry of a lost disarm", async () => {
+  const { panel, area, calls, fake } = setup({ status: IN_ALARM, flags: [0] });
+  fake.hang = true;
+  panel.disarm(area);
+  panel.arm(area, 1);
+  await flush();
+  fake.hang = false;
+  await reconnect(panel);
+  assert.deepEqual(cmds(calls), ["reset", "arm"]);
+});
+
+test("a remote disarm that got through is not sent again", async () => {
+  const { panel, area, calls } = setup({ status: IN_ALARM, flags: [0] });
+  await panel.disarm(area);
+  await reconnect(panel);
+  assert.deepEqual(cmds(calls), ["reset", "disarm"]);
 });

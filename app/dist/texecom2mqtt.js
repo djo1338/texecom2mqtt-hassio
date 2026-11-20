@@ -45612,6 +45612,9 @@ var import_promises3 = require("timers/promises");
 // interval of the re-read while an area is shown as "in alarm"
 var ALARM_REFRESH_DELAY = 3e3;
 var ALARM_POLL_INTERVAL = 6e4;
+// nojo: a remote disarm lost with the panel connection is sent again when the
+// panel is back, if it was requested less than this long ago
+var DISARM_RETRY_MAX_AGE = 12e4;
 var Panel = class extends import_events3.EventEmitter {
   constructor(config, log) {
     super();
@@ -45649,6 +45652,7 @@ var Panel = class extends import_events3.EventEmitter {
   alarmRefreshTimeout;
   areaRefreshReady = false;
   lastAlarmFlagsLog = {};
+  pendingDisarms = {};
   handlePanelStatus = async (status) => {
     this.emit("status", status);
     switch (status) {
@@ -45756,6 +45760,7 @@ var Panel = class extends import_events3.EventEmitter {
         this.initComplete = true;
         this.areaRefreshReady = true;
         this.initKeepalive();
+        this.retryLostDisarms();
         break;
       }
     }
@@ -46046,6 +46051,40 @@ var Panel = class extends import_events3.EventEmitter {
       this.refreshAlarmedAreas(reason);
     }, ALARM_REFRESH_DELAY);
   }
+  // nojo: the panel drops the connection for ~30-45 s on every alarm while it
+  // reports through SmartCom, and the commands queued meanwhile are lost. A
+  // remote disarm lost that way is sent again once the panel is back, only if
+  // the area is still in alarm and the request is less than 2 minutes old.
+  // Arming is never retried.
+  retryLostDisarms() {
+    const now = Date.now();
+    for (const area2 of this.areas) {
+      const requestedAt = this.pendingDisarms[area2.id];
+      if (requestedAt === void 0) {
+        continue;
+      }
+      const age = Math.round((now - requestedAt) / 1e3);
+      if (now - requestedAt > DISARM_RETRY_MAX_AGE) {
+        delete this.pendingDisarms[area2.id];
+        this.log.warning(`Not retrying the remote disarm of ${area2.name}: requested ${age}s ago`);
+        continue;
+      }
+      if (area2.status !== 5 /* InAlarm */) {
+        delete this.pendingDisarms[area2.id];
+        this.log.info(`Not retrying the remote disarm of ${area2.name}: no longer in alarm`);
+        continue;
+      }
+      this.log.info(
+        `Retrying the remote disarm of ${area2.name} requested ${age}s ago (the panel connection was lost)`
+      );
+      this.disarm(area2, { requestedAt }).catch((error) => {
+        if (error instanceof TexecomConnectionError) {
+          throw error;
+        }
+        this.log.warning(`Could not retry the remote disarm of ${area2.name}: ${error?.message ?? error}`);
+      });
+    }
+  }
   async refreshAlarmedAreas(reason, quiet = false) {
     if (!this.areaRefreshReady || !this.areas.some((area2) => area2.status === 5 /* InAlarm */)) {
       return;
@@ -46228,7 +46267,11 @@ var Panel = class extends import_events3.EventEmitter {
     return areas;
   }
   tAreaSize = () => tAreaSize(this.device.zones);
-  async disarm(area2) {
+  async disarm(area2, { requestedAt = Date.now(), retryIfLost = true } = {}) {
+    // nojo: remembered until the panel answers, see retryLostDisarms
+    if (retryIfLost) {
+      this.pendingDisarms[area2.id] = requestedAt;
+    }
     if (area2.status === 5 /* InAlarm */) {
       await this.reset(area2);
     }
@@ -46237,6 +46280,9 @@ var Panel = class extends import_events3.EventEmitter {
       this.device.zones,
       area2.number - 1
     );
+    if (this.pendingDisarms[area2.id] === requestedAt) {
+      delete this.pendingDisarms[area2.id];
+    }
     if (!success) {
       this.log.warning(`Could not disarm ${area2.name}`);
     }
@@ -46254,8 +46300,10 @@ var Panel = class extends import_events3.EventEmitter {
     this.scheduleAlarmRefresh("remote reset");
   }
   async arm(area2, armType) {
+    // nojo: arming cancels the retry of an earlier lost disarm
+    delete this.pendingDisarms[area2.id];
     if ([4 /* PartArmed */, 3 /* Armed */].includes(area2.status)) {
-      await this.disarm(area2);
+      await this.disarm(area2, { retryIfLost: false });
     }
     this.log.info(
       `Remotely arming ${area2.name} to ${ArmTypeDescriptions[armType]}`
